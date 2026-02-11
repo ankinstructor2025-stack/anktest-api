@@ -59,3 +59,34 @@ def create_session(req: SessionRequest):
         "user_id": user_id,
         "status": "session ok"
     }
+
+@app.post("/v1/qa_build")
+async def qa_build(
+    user_id: str = Form(...),
+    file: UploadFile = File(...),
+):
+    """
+    今回は「アップロードまで」：
+    受け取った対話ファイルを GCS に保存して、保存先を返す。
+    （次のステップで OpenAI→QA保存→qa.json更新 をここに追加する）
+    """
+    client = storage.Client()
+    bucket = client.bucket(BUCKET_NAME)
+
+    # 保存先（設計図どおり uploads/ 配下）
+    object_path = f"{user_id}/upload_files/{file.filename}"
+    blob = bucket.blob(object_path)
+
+    data = await file.read()
+    blob.upload_from_string(
+        data,
+        content_type=file.content_type or "application/octet-stream"
+    )
+
+    # ブラウザ側が履歴表示などに使えるよう、相対パスも返す
+    return {
+        "status": "uploaded",
+        "user_id": user_id,
+        "upload_file": f"upload_files/{file.filename}",
+        "gcs_object": object_path
+    }
