@@ -1,3 +1,4 @@
+from openai import OpenAI
 from fastapi import FastAPI, Form, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -89,4 +90,21 @@ async def qa_build(
         "user_id": user_id,
         "upload_file": f"upload_files/{file.filename}",
         "gcs_object": object_path
+    }
+
+@app.get("/v1/openai_echo")
+def openai_echo():
+
+    client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+
+    res = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "user", "content": "echo test"}
+        ]
+    )
+
+    return {
+        "ok": True,
+        "reply": res.choices[0].message.content
     }

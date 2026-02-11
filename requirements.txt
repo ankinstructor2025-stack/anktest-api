@@ -3,3 +3,4 @@ uvicorn
 google-cloud-storage
 python-multipart
 ulid-py
+openai
