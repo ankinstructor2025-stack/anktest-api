@@ -9,12 +9,16 @@ import json
 import os
 import io
 import ulid  # pip: ulid-py
+from urllib.parse import quote
 
 app = FastAPI()
 
 # できれば環境変数優先（無ければ教材の固定値）
 BUCKET_NAME = os.environ.get("UPLOAD_BUCKET", "anktest")
 
+def _safe_ascii_filename(name: str) -> str:
+    # 日本語などは落ちるので、ヘッダ用はASCIIに退避
+    return "download"
 
 def _build_qa_prompt(dialogue_text: str) -> str:
     return (
@@ -271,10 +275,16 @@ def download_file(user_id: str = Query(...), path: str = Query(...)):
     mime = mime or "application/octet-stream"
 
     filename = path.split("/")[-1]
+
+    ascii_name = _safe_ascii_filename(filename)
+    utf8_name = quote(filename, safe="")
+
     return StreamingResponse(
         io.BytesIO(data),
         media_type=mime,
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={
+            "Content-Disposition": f"attachment; filename={ascii_name}; filename*=UTF-8''{utf8_name}"
+        },
     )
 
 @app.get("/v1/openai_echo")
