@@ -3,6 +3,7 @@ from fastapi import FastAPI, Form, UploadFile, File, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from google.cloud import storage
+import mimetypes
 import json
 import os
 
