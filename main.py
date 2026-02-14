@@ -202,6 +202,49 @@ async def qa_build(
             "error": str(e),
         }
 
+@app.get("/v1/files")
+def list_files(user_id: str = Query(...)):
+    """
+    図の GET /v1/files
+    - user_id の upload_files 一覧を返す
+    - qa.json(records) から upload→qa の対応を返す
+    """
+    client = storage.Client()
+    bucket = client.bucket(BUCKET_NAME)
+
+    qa_json = _ensure_user_qa_json(bucket, user_id)
+    records = qa_json.get("records", [])
+
+    # upload_file -> qa_file の対応（同一uploadが複数回なら最新を優先）
+    upload_to_qa = {}
+    for r in records:
+        uf = r.get("upload_file")
+        qf = r.get("qa_file")
+        if uf:
+            upload_to_qa[uf] = qf  # 後勝ち
+
+    # upload_files をGCSから列挙
+    prefix = f"{user_id}/upload_files/"
+    uploads = []
+    for blob in client.list_blobs(bucket, prefix=prefix):
+        # {user_id}/ を外して相対パスにする
+        rel = blob.name[len(user_id) + 1:]  # "upload_files/xxx"
+        uploads.append(rel)
+
+    uploads = sorted(set(uploads))
+
+    out = []
+    for uf in uploads:
+        qf = upload_to_qa.get(uf)  # "qa_files/xxxx.json" or None
+        out.append({
+            "upload_file": uf,
+            "qa_file": qf,
+            # DLは署名URLにせずAPI経由（確実に動く）
+            "upload_url": f"/v1/file?user_id={user_id}&path={uf}",
+            "qa_url": f"/v1/file?user_id={user_id}&path={qf}" if qf else None,
+        })
+
+    return {"user_id": user_id, "records": out}
 
 @app.get("/v1/openai_echo")
 def openai_echo():
