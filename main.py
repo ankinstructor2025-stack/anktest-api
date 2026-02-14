@@ -246,6 +246,35 @@ def list_files(user_id: str = Query(...)):
 
     return {"user_id": user_id, "records": out}
 
+@app.get("/v1/file")
+def download_file(user_id: str = Query(...), path: str = Query(...)):
+    """
+    /v1/file?user_id=...&path=upload_files/xxx or qa_files/xxx.json
+    - GCSのオブジェクトをAPI経由でダウンロードさせる
+    """
+    if not path:
+        raise HTTPException(status_code=400, detail="path is required")
+
+    object_path = f"{user_id}/{path}"
+
+    client = storage.Client()
+    bucket = client.bucket(BUCKET_NAME)
+    blob = bucket.blob(object_path)
+
+    if not blob.exists():
+        raise HTTPException(status_code=404, detail="file not found")
+
+    data = blob.download_as_bytes()
+    mime, _ = mimetypes.guess_type(path)
+    mime = mime or "application/octet-stream"
+
+    filename = path.split("/")[-1]
+    return StreamingResponse(
+        io.BytesIO(data),
+        media_type=mime,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
 @app.get("/v1/openai_echo")
 def openai_echo():
     client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
