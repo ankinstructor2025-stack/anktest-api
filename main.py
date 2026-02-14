@@ -1,14 +1,18 @@
 from openai import OpenAI
-from fastapi import FastAPI, Form, UploadFile, File, HTTPException
+from fastapi import FastAPI, Form, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from google.cloud import storage
 import json
 import os
 
+import ulid  # pip: ulid-py
+
 app = FastAPI()
 
-BUCKET_NAME = "anktest"
+# できれば環境変数優先（無ければ教材の固定値）
+BUCKET_NAME = os.environ.get("UPLOAD_BUCKET", "anktest")
+
 
 def _build_qa_prompt(dialogue_text: str) -> str:
     return (
@@ -22,8 +26,6 @@ def _build_qa_prompt(dialogue_text: str) -> str:
         f"{dialogue_text}\n"
     )
 
-class SessionRequest(BaseModel):
-    user_id: str
 
 # CORS: ブラウザ(GitHub Pages) → Cloud Run のため
 app.add_middleware(
@@ -34,45 +36,69 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 class SessionRequest(BaseModel):
     user_id: str
+
 
 @app.get("/")
 def root():
     return {"message": "anktest-api is running"}
 
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
+
+def _ensure_user_qa_json(bucket, user_id: str) -> dict:
+    """
+    {user_id}/qa.json が無ければ作成し、内容(dict)を返す
+    """
+    blob_path = f"{user_id}/qa.json"
+    blob = bucket.blob(blob_path)
+
+    if not blob.exists():
+        init_data = {"user_id": user_id, "records": []}
+        blob.upload_from_string(
+            json.dumps(init_data, ensure_ascii=False, indent=2),
+            content_type="application/json",
+        )
+        return init_data
+
+    text = blob.download_as_text(encoding="utf-8")
+    try:
+        data = json.loads(text)
+    except Exception:
+        # 壊れていたら最低限復旧（教材用途で止めない）
+        data = {"user_id": user_id, "records": []}
+    if "user_id" not in data:
+        data["user_id"] = user_id
+    if "records" not in data or not isinstance(data["records"], list):
+        data["records"] = []
+    return data
+
+
+def _save_user_qa_json(bucket, user_id: str, qa_json: dict) -> None:
+    blob_path = f"{user_id}/qa.json"
+    blob = bucket.blob(blob_path)
+    blob.upload_from_string(
+        json.dumps(qa_json, ensure_ascii=False, indent=2),
+        content_type="application/json",
+    )
+
+
 @app.post("/v1/session")
 def create_session(req: SessionRequest):
-
     user_id = req.user_id
 
     client = storage.Client()
     bucket = client.bucket(BUCKET_NAME)
 
-    blob_path = f"{user_id}/qa.json"
-    blob = bucket.blob(blob_path)
+    _ = _ensure_user_qa_json(bucket, user_id)
 
-    # 既に存在するか
-    if not blob.exists():
+    return {"user_id": user_id, "status": "session ok"}
 
-        init_data = {
-            "user_id": user_id,
-            "records": []
-        }
-
-        blob.upload_from_string(
-            json.dumps(init_data, ensure_ascii=False, indent=2),
-            content_type="application/json"
-        )
-
-    return {
-        "user_id": user_id,
-        "status": "session ok"
-    }
 
 @app.post("/v1/qa_build")
 async def qa_build(
@@ -80,35 +106,38 @@ async def qa_build(
     file: UploadFile = File(...),
 ):
     """
-    既存の「アップロード」は維持。
-    追加で「QA生成だけ」を実施し、レスポンスに qa を載せる（保存はしない）。
+    1) 対話ファイルを GCS に保存
+    2) OpenAIでQA生成
+    3) 成功した場合のみ
+       - QAファイルをGCSに保存
+       - qa.json(records) を追記して保存
     """
-    # ---- 既存：GCSアップロード（そのまま） ----
     client = storage.Client()
     bucket = client.bucket(BUCKET_NAME)
 
-    object_path = f"{user_id}/upload_files/{file.filename}"
-    blob = bucket.blob(object_path)
+    # ---- 1) 既存：GCSアップロード（維持） ----
+    upload_rel_path = f"upload_files/{file.filename}"
+    upload_object_path = f"{user_id}/{upload_rel_path}"
+    upload_blob = bucket.blob(upload_object_path)
 
     data = await file.read()
-    blob.upload_from_string(
+    upload_blob.upload_from_string(
         data,
-        content_type=file.content_type or "application/octet-stream"
+        content_type=file.content_type or "application/octet-stream",
     )
 
-    # ---- 追加：QA生成だけ（保存なし） ----
+    # OPENAI_API_KEY が無ければ、アップロード成功だけ返す（教材の途中でも止めない）
     if not os.environ.get("OPENAI_API_KEY"):
-        # アップロードは成功しているので、ここは 500 にせず状態を返す
         return {
             "status": "uploaded_but_qa_skipped",
             "reason": "OPENAI_API_KEY is not set",
             "user_id": user_id,
-            "upload_file": f"upload_files/{file.filename}",
-            "gcs_object": object_path
+            "upload_file": upload_rel_path,
+            "gcs_object": upload_object_path,
         }
 
+    # ---- 2) QA生成 ----
     try:
-        # 文字化けしても止めずに続行（最低限）
         try:
             dialogue_text = data.decode("utf-8")
         except UnicodeDecodeError:
@@ -123,42 +152,64 @@ async def qa_build(
         )
         content = res.choices[0].message.content or ""
 
-        # JSONとして返せる形だけ保証（失敗してもアップロードは壊さない）
         qa_list = json.loads(content)
         if not isinstance(qa_list, list):
             raise ValueError("QA JSON is not a list")
 
+        # ---- 3) 成功時のみ：QAファイル保存 + qa.json更新 ----
+        qa_id = str(ulid.new())
+
+        qa_rel_path = f"qa_files/{qa_id}.json"
+        qa_object_path = f"{user_id}/{qa_rel_path}"
+        qa_blob = bucket.blob(qa_object_path)
+
+        qa_blob.upload_from_string(
+            json.dumps(qa_list, ensure_ascii=False, indent=2),
+            content_type="application/json",
+        )
+
+        qa_json = _ensure_user_qa_json(bucket, user_id)
+
+        qa_json["records"].append(
+            {
+                "qa_id": qa_id,
+                "upload_file": upload_rel_path,
+                "qa_file": qa_rel_path,
+            }
+        )
+
+        _save_user_qa_json(bucket, user_id, qa_json)
+
         return {
-            "status": "uploaded_and_qa_generated",
+            "status": "uploaded_and_qa_saved",
             "user_id": user_id,
-            "upload_file": f"upload_files/{file.filename}",
-            "gcs_object": object_path,
-            "qa": qa_list
+            "qa_id": qa_id,
+            "upload_file": upload_rel_path,
+            "qa_file": qa_rel_path,
+            "gcs_upload_object": upload_object_path,
+            "gcs_qa_object": qa_object_path,
+            "qa_count": len(qa_list),
+            "qa": qa_list,  # 画面で確認できるように返す（必要なら後で削除可）
         }
 
     except Exception as e:
-        # 失敗しても「アップロード済み」は維持して返す
+        # 失敗しても「アップロード済み」は維持して返す（qa.jsonは更新しない）
         return {
             "status": "uploaded_but_qa_failed",
             "user_id": user_id,
-            "upload_file": f"upload_files/{file.filename}",
-            "gcs_object": object_path,
+            "upload_file": upload_rel_path,
+            "gcs_object": upload_object_path,
             "error": str(e),
         }
 
+
 @app.get("/v1/openai_echo")
 def openai_echo():
-
     client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
     res = client.chat.completions.create(
         model="gpt-4o-mini",
-        messages=[
-            {"role": "user", "content": "echo test"}
-        ]
+        messages=[{"role": "user", "content": "echo test"}],
     )
 
-    return {
-        "ok": True,
-        "reply": res.choices[0].message.content
-    }
+    return {"ok": True, "reply": res.choices[0].message.content}
